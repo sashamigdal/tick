@@ -1,33 +1,37 @@
+import os
 from queue import Queue, Empty
 import imageio
 
 import numpy as np
 import multiprocessing as mp
 
-from commonFunctions import MakeNewDir, RemoveFiles
+from commonFunctions import MakeNewDir, RemoveFiles, MAT_TYPE
 from .plot import RankHist2, PLOT_DATA, PlotXYErrBars, Plot
 
 
 class Conditional():
-    def __init__(self,times, returns,signals):
+    def __init__(self,times, returns,signals, lengths):
         '''
-        :param times: (T,1)stamps
-        :param returns: (T,N) returns
-        :param signals: (T,N) signals
+        :param times: (T,)stamps
+        :param returns: (LL) returns
+        :param signals: (LL) signals
+        :param lengths: length of each day data
         '''
-        ord = np.argsort(times)
-        self.times = times[ord]
-        self.returns = returns[ord]
-        self.signals = signals[ord]
+        self.times = times
+        self.returns = returns
+        self.signals = signals
+        self.lengths = lengths
 
     def FutureMove(self,name,chance,steps_fwd=10,take_abs=True):
         T = len(self.times)
-        targets = self.returns  # (T,N) , return in BP for each stock
-        strength = self.signals  # (T,N) , zeros where not traded
+        N = self.lengths[0]
+        assert(np.sum(self.lengths != N)  == 0)
+        targets = np.cumsum(self.returns.reshape(T,N) ,axis=0) # (T,N) , return in BP for each stock
+        signals = self.signals.reshape(T,N)
+        strength = np.abs(signals)
+        pool_strength = signals  # (T,N) , zeros where not traded
         if take_abs:
-            strength = np.abs(strength)
-        pool_strength = strength.flatten()
-        targets = np.cumsum(targets, axis=0)
+             pool_strength = np.abs(pool_strength)
         pool_strength = pool_strength[pool_strength>0]
         id = int(chance * len(pool_strength))
         thresh = np.sort(pool_strength)[id]
@@ -36,7 +40,7 @@ class Conditional():
         nums = np.zeros(steps_fwd, dtype=np.float)
         for t1 in range(1,T-steps_fwd):
             filter = (strength[t1]>thresh).astype(np.float)
-            sgn = np.sign(self.signals[t1])
+            sgn = np.sign(signals[t1])
             num = filter.sum()
             for dt in range(steps_fwd):
                 delta = targets[t1+dt]- targets[t1-1]
@@ -92,9 +96,12 @@ class Conditional():
         imageio.mimsave(PLOT_DATA + '%s_mean_pnl.movie.gif' % name, images)
 
 
-    def TargetAboveThresholdParallel(self, name, chances, num_cores=16, take_abs=True):
+    def TargetAboveThresholdParallel(self, name, chances, num_cores=16, take_abs=True, cut_delta=1.5):
         targets = self.returns.flatten() # (T*N) , return in BP for each stock
         strength = self.signals.flatten() #(T*N) , zeros where not traded
+        ok = np.abs(targets) < cut_delta
+        targets = targets[ok]
+        strength = strength[ok]
         if take_abs:
             targets *= np.sign(strength)
             strength = np.abs(strength)
@@ -115,7 +122,6 @@ class Conditional():
             pass
         else:
             queue = mp.Queue()
-
             for chance in chances:
                 n = (chance * lims).astype(np.int64)
                 queue.put((chance,n))
@@ -156,10 +162,11 @@ def test_FutureMoves():
     noise = np.random.normal(scale=0.1, size=(T, N))
     returns = signals + noise
     times = np.arange(T, dtype=np.int32)
-    CND = Conditional(times, returns, signals)
+    lengths = np.array([N] * T, np.int32)
+    CND = Conditional(times, returns, signals,lengths)
     chances = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.92, 0.95, 0.97, 0.99]
-    RemoveFiles(PLOT_DATA,"mean_pnl")
-    CND.FutureMovesParallel(name='test',chances=chances,num_cores=16, steps_fwd=10 )
+    RemoveFiles(PLOT_DATA,"test")
+    CND.FutureMovesParallel(name='test',chances=chances,num_cores=-1, steps_fwd=10 )
 
 
 def test_TestCondHist():
@@ -174,13 +181,44 @@ def test_TestCondHist():
     noise = np.random.normal(scale=0.25, size=(T, N))
     returns = signals + noise
     times = np.arange(T, dtype=np.int32)
-    CND = Conditional(times, returns, signals)
+    lengths = np.array([N]*T,np.int32)
+    CND = Conditional(times, returns, signals,lengths)
     chances = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.92, 0.95, 0.97, 0.99]
-    RemoveFiles(PLOT_DATA,"cond_hist_chance")
-    RemoveFiles(PLOT_DATA, "pnl_above_thresh")
+    RemoveFiles(PLOT_DATA,"test")
     CND.TargetAboveThresholdParallel('test', chances, num_cores=16, take_abs=True)
 
+def test_OrcaData():
+    '''
+       :param T: number of days
+       :param N: number of stocks
+       :return:
+       '''
 
+    ll = len('20211006.ndx')
+    dir =  os.path.join(os.path.dirname(__file__), 'orca_data/from_orca/')
+    files = os.listdir(dir)
+    times = np.empty(0,np.int32)
+    signals = np.empty(0, MAT_TYPE)
+    returns = np.empty(0, MAT_TYPE)
+    lengths = np.empty(0, np.int32)
+    for fname in files:
+        if not fname.endswith('.ndx'): continue
+        int_date = int(fname[-ll:-4])
+        dd = np.fromfile(dir + fname, MAT_TYPE)
+        times = np.append(times, int_date)
+        lengths = np.append(lengths, len(dd))
+        if fname.startswith('deltas'):
+            returns = np.append(returns,dd)
+        elif fname.startswith('preds'):
+            signals = np.append(signals, -dd)#negative signe due to mean reversion of the signal
+        else:
+            assert( False, 'wrong file')
+    T = len(times)
+    assert(len(returns) == len(signals),'length mismatch')
+    CND = Conditional(times, returns, signals,lengths)
+    RemoveFiles(PLOT_DATA, "orca")
+    chances = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.92, 0.95, 0.97, 0.99]
+    CND.TargetAboveThresholdParallel('orca', chances, num_cores=16, take_abs=True)
 def test_roll_cumsum():
     num_steps_fwd = 5
     sub_targets = np.arange(30,dtype=np.float).reshape((10,3))
